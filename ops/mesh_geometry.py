@@ -1,6 +1,9 @@
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
 from torch_scatter import scatter
+
 from pytorch3d.structures import Meshes
 from einops import rearrange, einsum, repeat
 
@@ -130,25 +133,6 @@ def Electric_strength(q, p):
     p = p.unsqueeze(0)
     return (p-q)/(torch.norm(p-q, dim=-1, keepdim=True)**3+1e-6)
 
-def Winding_Occupancy(mesh_tem, points):
-    """
-    Involving the winding number to evaluate the occupancy of the points relative to the mesh
-    mesh_tem
-    points: the points to be evaluated
-    charge: the charge position
-    """
-    face_coordinates= mesh_tem.verts_packed()[mesh_tem.faces_packed()]
-    face_centers = face_coordinates.mean(-2)
-    normals_areaic = mesh_tem.faces_normals_packed() * mesh_tem.faces_areas_packed().unsqueeze(-1)
-
-
-    face_elefields_temp = Electric_strength(points, face_centers)
-    winding_field = einsum(face_elefields_temp, normals_areaic, 'm n c, n c -> m')/4/np.pi
-
-    winding_field = torch.sigmoid((winding_field-0.2)*20)
-
-    return winding_field
-
 
 
 def Winding_Occupancy(mesh_tem: Meshes, points: torch.Tensor):
@@ -165,3 +149,90 @@ def Winding_Occupancy(mesh_tem: Meshes, points: torch.Tensor):
     winding_field = einsum(face_elefields_temp, normals_areaic, 'm n c, n c -> m')/4/np.pi
 
     return winding_field
+
+
+class Differentiable_Voxelizer(nn.Module):
+    def __init__(self, bbox_density=128):
+        super(Differentiable_Voxelizer, self).__init__()
+        self.bbox_density = bbox_density
+
+    def forward(self, mesh_src: Meshes, output_resolution=256):
+        """
+        mesh_src: the source mesh to be voxelized (should be rescaled into the normalized coordinates [-1,1])
+        return_type: the type of the return
+        """
+
+
+        # random sampling in bounding box
+        resolution = self.bbox_density
+        bbox = mesh_src.get_bounding_boxes()[0]
+
+        # grid sampling in bounding box
+        bbox_length = (bbox[:, 1] - bbox[:, 0])
+        step_lengths = bbox_length.max() / resolution
+        step = (bbox_length / step_lengths).int() + 1
+
+        x = torch.linspace(bbox[0, 0], bbox[0, 1], steps=step[0], device=mesh_src.device)
+        y = torch.linspace(bbox[1, 0], bbox[1, 1], steps=step[1], device=mesh_src.device)
+        z = torch.linspace(bbox[2, 0], bbox[2, 1], steps=step[2], device=mesh_src.device)
+
+        
+
+        x_index, y_index, z_index = torch.meshgrid(x, y, z)
+
+        slice_length_ranking, slice_direction_ranking = torch.sort(step, descending=False)
+
+        # change the order of the coordinates for the acceleration 
+        slice_direction_ranking_reverse = torch.argsort(slice_direction_ranking,descending=False)
+
+
+        coordinates = torch.stack([x_index, y_index, z_index], dim=-1)
+
+
+        coordinates = coordinates.permute(slice_direction_ranking.tolist() + [3])
+
+
+        coordinates = rearrange(coordinates, 'x y z c -> x (y z) c', c = 3, x = slice_length_ranking[0], y = slice_length_ranking[1], z = slice_length_ranking[2])
+        occupency_fields = []
+        for i in range(0, coordinates.shape[0]):
+            tem_charge = coordinates[i]
+
+            occupency_temp = torch.sigmoid((Winding_Occupancy(mesh_src, tem_charge)-0.5)*100)
+
+            occupency_fields.append(occupency_temp)
+
+        occupency_fields = torch.stack(occupency_fields, dim=0)
+
+        # embedding the bounding box into the whole space
+        resolution_whole = output_resolution
+        bbox_index = (bbox +1)*resolution_whole//2
+        X_b, Y_b, Z_b = bbox_index.int().tolist()
+        whole_image = torch.zeros(resolution_whole, resolution_whole, resolution_whole, device=mesh_src.device)
+
+        bbox_transformed = rearrange(occupency_fields, 'x (y z) -> x y z', x = slice_length_ranking[0], y = slice_length_ranking[1], z = slice_length_ranking[2])
+
+        bbox_transformed = bbox_transformed.permute(slice_direction_ranking_reverse.tolist()).unsqueeze(0).unsqueeze(0)
+
+        bbox_transformed = F.interpolate(bbox_transformed, size=(X_b[1]-X_b[0]+1, Y_b[1]-Y_b[0]+1, Z_b[1]-Z_b[0]+1), mode='trilinear')
+        bbox_transformed = bbox_transformed.squeeze(0).squeeze(0)
+
+        whole_image[X_b[0]:X_b[1]+1, Y_b[0]:Y_b[1]+1, Z_b[0]:Z_b[1]+1] = bbox_transformed
+
+        whole_image = (whole_image.permute(2, 1, 0)).unsqueeze(0)
+
+        return whole_image
+    
+
+
+
+
+
+def normalize_mesh(mesh, rescalar=1.1):
+    bbox = mesh.get_bounding_boxes()
+    center = (bbox[:, :, 0] + bbox[:, :, 1]) / 2
+    size = (bbox[:, :, 1] - bbox[:, :, 0]) 
+    scale = 2.0 / (torch.max(size)*rescalar+1e-8)
+
+    mesh = mesh.update_padded((mesh.verts_padded()-center)*scale+center)
+    return mesh
+

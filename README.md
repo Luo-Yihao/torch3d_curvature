@@ -3,7 +3,7 @@
 `Torch3D_Curvature` is a complement and correction to the `PyTorch3D` library, created by Yihao Luo. It provides elegant and efficient methods to compute the curvature for both a mesh or point cloud and relevant algorithms about computational geometry using `PyTorch`.
 
 
-![Gaussian Curvatures of the Mesh of Kitty](images/Kitty_curvature.jpg "Gaussian Curvatures of the mesh of Kitty by Torch3D_Curvature")
+![Gaussian Curvatures of the Mesh of Kitty](images/KittyCurvature.jpg "Gaussian Curvatures of the mesh of Kitty by Torch3D_Curvature")
 ## Functions 
 
 - Compute the Gaussian curvature of triangular meshes by discrete Gauss-Bonnet theorem

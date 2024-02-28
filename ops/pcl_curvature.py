@@ -21,11 +21,10 @@ def Weingarten_maps(pointscloud:torch.Tensor, k=50)->torch.Tensor:
 
     pointscloud_shape = pointscloud.shape
     batch_size = pointscloud_shape[0]
-    num_points = torch.LongTensor([pointscloud_shape[1]]*batch_size)
 
     # undo global mean for stability
     pointscloud_centered = pointscloud - pointscloud.mean(-2).view(batch_size,1,3)
-    knn_info = knn_points(pointscloud_centered,pointscloud_centered,lengths1=num_points,lengths2=num_points,K=k,return_nn=True)
+    knn_info = knn_points(pointscloud_centered,pointscloud_centered,K=k,return_nn=True)
     
     # compute knn & covariance matrix 
     knn_point_centered = knn_info.knn - knn_info.knn.mean(-2).view(batch_size,-1,1,3)
@@ -49,7 +48,7 @@ def Weingarten_maps(pointscloud:torch.Tensor, k=50)->torch.Tensor:
     normals_field = (1.0 - 2.0 * flip) * normals_field
 
     # local normals difference
-    local_normals_difference = knn_gather(normals_field,knn_info.idx,lengths=num_points)[:,:,1:k,:] - normals_field[:,:,None,:]
+    local_normals_difference = knn_gather(normals_field,knn_info.idx)[:,:,1:k,:] - normals_field[:,:,None,:]
 
     # project the difference onto the tangent plane, getting the differential of the gaussian map
     local_dpt_tangent1 = (local_pt_difference * tangent1_field[:,:,None,:]).sum(-1,keepdim=True)
@@ -83,7 +82,7 @@ def Weingarten_maps(pointscloud:torch.Tensor, k=50)->torch.Tensor:
     a_b_b2 = torch.stack((a_b,2*b),dim=-1).view(batch_size,-1,1,2)
     c = torch.stack((a2_a_b,a_b_b2),dim=-2).view(batch_size,-1,2,2)
 
-    E = (1/c+1e-6) * Q_TSQ
+    E = (1/c+1e-8) * Q_TSQ
     Weingarten_fields = torch.matmul(Q,torch.matmul(E,Q.transpose(-1,-2)))
 
 
