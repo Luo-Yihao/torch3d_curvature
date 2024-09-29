@@ -7,29 +7,80 @@ from torch_scatter import scatter
 import numpy as np
 
 
+def disambiguate(normals, pointscloud, K = 15):
+        
+    normals_field = 1.0*normals # flip the normals to make them point outward
+
+    current_set = set([0])
+
+    finished_set = set()
+
+    knn_info = knn_points(pointscloud, pointscloud, K=K)
+
+    while len(current_set) > 0:
+
+        renew_index = knn_info.idx[:,list(current_set),:]
+
+        current_normals = knn_gather(normals_field,renew_index)
+
+        direction_consistency = (current_normals * current_normals[:,:,0:1,:]).sum(-1,keepdim=True)
+
+        direction_consistency = torch.where(direction_consistency>0, 1, -1)
+
+        renew_normals = current_normals * direction_consistency
+
+        for j in range(renew_index.shape[1]):
+            normals_field[:,(renew_index[:,j,:]).view(-1),:] = renew_normals[:,j,:,:]
+            
+        finished_set = finished_set.union(current_set)
+
+        current_set = set(renew_index[:,:,1:].reshape(-1).tolist())
+
+        current_set = current_set - finished_set   
+
+    return normals_field        
+
+
 class Differentiable_Global_Geometry_PointCloud(nn.Module):
 
-    def __init__(self, pointscloud, k = 50):
+    def __init__(self, pointscloud, k = 20, normals_field = None, knn_info = None, normals=None):
         super().__init__()
         self.k = k
 
         self.pointscloud = pointscloud
-        self.knn_info, self.frames_field = self.frames_field_from_local_statistics(pointscloud, k)
+        if knn_info is None:
+            if normals_field is not None:
+                self.knn_info = knn_points(torch.cat([pointscloud,normals_field*0.02],dim=-1),torch.cat([pointscloud,normals_field*0.02],dim=-1),K=k,return_nn=True)
+            else:
+                self.knn_info = knn_points(pointscloud,pointscloud,K=k,return_nn=True)
+        else:
+            self.knn_info = knn_info
 
+        self.frames_field = self.frames_field_from_local_statistics(pointscloud, self.knn_info)
 
-    def frames_field_from_local_statistics(self, pointscloud, k):
+        if normals is not None:
+            self.frames_field[:,:,0,:] = normals
+            self.frames_field[:,:,1,:] = self.frames_field[:,:,1,:] - (self.frames_field[:,:,1,:]*self.frames_field[:,:,0,:]).sum(-1,keepdim=True)*self.frames_field[:,:,0,:]
+            self.frames_field[:,:,1,:] = self.frames_field[:,:,1,:]/self.frames_field[:,:,1,:].norm(dim=-1,keepdim=True)
+            self.frames_field[:,:,2,:] = torch.cross(self.frames_field[:,:,0,:],self.frames_field[:,:,1,:])
+
+    def frames_field_from_local_statistics(self, pointscloud, knn_info = None):
 
         # undo global mean for stability
-        knn_info = knn_points(pointscloud,pointscloud,K=k,return_nn=True)
+        if knn_info is None:
+            knn_info = self.knn_info
 
         # compute knn & covariance matrix 
-        knn_points_centered = knn_info.knn - knn_info.knn.mean(-2,keepdim=True)
+        knn_points_centered = knn_info.knn[...,:3] - knn_info.knn[...,:3].mean(-2,keepdim=True)
         covs_field = torch.matmul(knn_points_centered.transpose(-1,-2),knn_points_centered) /(knn_points_centered.shape[-1]-1)
         frames_field = torch.linalg.eigh(covs_field).eigenvectors.transpose(-1,-2) # B x N x 3 x 3
 
+        # disambiguate the normals
+        frames_field[:,:,0,:] = disambiguate(frames_field[:,:,0,:], pointscloud, K = 5)
+
         frames_field[:,:,1,:] = frames_field[:,:,1,:]*frames_field.det().unsqueeze(-1)
 
-        return knn_info, frames_field
+        return frames_field
     
 
     def local_voronoi_area(self, frames_field: torch.Tensor=None, local_W: int=128, n_temp: int=2000):
@@ -59,7 +110,7 @@ class Differentiable_Global_Geometry_PointCloud(nn.Module):
 
         # ----------------- tangent plane projection ---------------
 
-        local_pt_difference = knn_info.knn - self.pointscloud[:,:,None,:] # B x N x K x 3
+        local_pt_difference = knn_info.knn[...,:3] - self.pointscloud[:,:,None,:] # B x N x K x 3
 
 
         tangent1_field = frames_field[:,:,1,:] # B x N x  3
@@ -71,12 +122,7 @@ class Differentiable_Global_Geometry_PointCloud(nn.Module):
         local_dpt_tangent2 = (local_pt_difference * tangent2_field[:,:,None,:]).sum(-1,keepdim=True) # B x N x K x 1
         local_dpt_tangent = torch.cat((local_dpt_tangent1,local_dpt_tangent2),dim=-1) # B x N x K x 2
         
-        # local normals difference
-        if frames_field is None:
-            frames_field = self.frames_field
         
-
-
 
                 # ----------------- local exclusive voronoi area ----------
         local_rescalar = 1.1
@@ -131,7 +177,7 @@ class Differentiable_Global_Geometry_PointCloud(nn.Module):
 
 
 
-    def weingarten_fields(self, frames_field: torch.Tensor=None):
+    def weingarten_fields(self, frames_field: torch.Tensor=None, if_strict: bool=False):
         """
         Compute the weingarten map for the point cloud using the tangent plane projection
         
@@ -150,13 +196,12 @@ class Differentiable_Global_Geometry_PointCloud(nn.Module):
 
         # ----------------- tangent plane projection ---------------
 
-        local_pt_difference = knn_info.knn - self.pointscloud[:,:,None,:] # B x N x K x 3
+        local_pt_difference = knn_info.knn[...,:3] - self.pointscloud[:,:,None,:] # B x N x K x 3
 
         normals_field  = frames_field[:,:,0,:] # B x N x  3
         tangent1_field = frames_field[:,:,1,:] # B x N x  3
         tangent2_field = frames_field[:,:,2,:]  # B x N x  3
     
-
         # project the difference onto the tangent plane, getting the differential of the gaussian map
 
         # local normals difference
@@ -166,10 +211,18 @@ class Differentiable_Global_Geometry_PointCloud(nn.Module):
         local_dpt_tangent1 = (local_pt_difference * tangent1_field[:,:,None,:]).sum(-1,keepdim=True) # B x N x K x 1
         local_dpt_tangent2 = (local_pt_difference * tangent2_field[:,:,None,:]).sum(-1,keepdim=True) # B x N x K x 1
         local_dpt_tangent = torch.cat((local_dpt_tangent1,local_dpt_tangent2),dim=-1) # B x N x K x 2
+        # local_dpt_tangent_length2 = local_dpt_tangent.norm(dim=-1,keepdim=True)
+
+        # quadratic normalization of the tangent plane
+        # local_dpt_tangent = local_dpt_tangent/(local_dpt_tangent_length2+1e-8)*torch.exp(-local_dpt_tangent_length2**2)
+
 
         local_dnormals_tangent1 = (local_normals_difference * tangent1_field[:,:,None,:]).sum(-1,keepdim=True)
         local_dnormals_tangent2 = (local_normals_difference * tangent2_field[:,:,None,:]).sum(-1,keepdim=True)
         local_dnormals_tangent = torch.cat((local_dnormals_tangent1,local_dnormals_tangent2),dim=-1) # B x N x K x 2
+        
+        # quadratic normalization of the tangent plane
+        # local_dnormals_tangent = local_dnormals_tangent/(local_dpt_tangent_length2+1e-8)*torch.exp(-local_dpt_tangent_length2)
         
 
         # ----------------- weingarten map ---------------------
@@ -177,9 +230,15 @@ class Differentiable_Global_Geometry_PointCloud(nn.Module):
         # estimate the weingarten map by solving a least squares problem: W = Dn^T Dp (Dp^T Dp)^-1
         XXT = torch.matmul(local_dpt_tangent.transpose(-1,-2),local_dpt_tangent)
         YXT = torch.matmul(local_dnormals_tangent.transpose(-1,-2),local_dpt_tangent)
+
+        if if_strict == False:
+            Weingarten_fields = torch.matmul(YXT,torch.inverse(XXT+1e-8*torch.eye(2).type_as(XXT)))
+            Weingarten_fields = (Weingarten_fields+Weingarten_fields.transpose(-1,-2))/2
+            return Weingarten_fields
+
+
         XYT = torch.matmul(local_dpt_tangent.transpose(-1,-2),local_dnormals_tangent)
         #Weingarten_fields_0 = torch.matmul(YXT,torch.inverse(XXT+1e-8*torch.eye(2).type_as(XXT))) ## the unsymetric version
-
 
         # solve the sylvester equation to get the shape operator (symmetric version)
         S = YXT + XYT
@@ -197,29 +256,95 @@ class Differentiable_Global_Geometry_PointCloud(nn.Module):
         a_b_b2 = torch.stack((a_b,2*b),dim=-1).view(B,-1,1,2)
         c = torch.stack((a2_a_b,a_b_b2),dim=-2).view(B,-1,2,2)
 
-        E =  (1/(c+1e-8)) * Q_TSQ
+        E =  (1/(c+1e-10)) * Q_TSQ
         Weingarten_fields = torch.matmul(Q,torch.matmul(E,Q.transpose(-1,-2)))
-
-
         return Weingarten_fields
 
+    def gaussian_curvature(self, frames_field: torch.Tensor=None, if_strict: bool=False):
+        """
+        Compute the weingarten map for the point cloud using the tangent plane projection
         
+        """
+        knn_info = self.knn_info
 
-    def gaussian_curvature(self, frames_field: torch.Tensor=None):
-        Weingarten_fields = self.weingarten_fields(frames_field)
+        # local normals difference
+        if frames_field is None:
+            frames_field = self.frames_field
 
-        gaussian_curvature_pcl = torch.det(Weingarten_fields)
+        weingarten_fields = self.weingarten_fields(frames_field, if_strict)
+
+        gaussian_curvature_pcl = weingarten_fields.det()
 
         return gaussian_curvature_pcl
 
+        
 
-    def differentiable_euler_number(self, frames_field: torch.Tensor=None, local_W: int=128, n_temp: int=2000):
+        # # ----------------- tangent plane projection ---------------
 
-        voronoi_area_list = self.local_voronoi_area(frames_field, local_W, n_temp)
+        # local_pt_difference = knn_info.knn - self.pointscloud[:,:,None,:] # B x N x K x 3
+
+        # normals_field  = frames_field[:,:,0,:] # B x N x  3
+        # tangent1_field = frames_field[:,:,1,:] # B x N x  3
+        # tangent2_field = frames_field[:,:,2,:]  # B x N x  3
+    
+
+        # # project the difference onto the tangent plane, getting the differential of the gaussian map
+
+        # # local normals difference
+        # local_normals_difference = knn_gather(normals_field,knn_info.idx) - normals_field.unsqueeze(-2) # B x N x K x 3
+
+        # # project the difference onto the tangent plane, getting the differential of the gaussian map
+        # local_dpt_tangent1 = (local_pt_difference * tangent1_field[:,:,None,:]).sum(-1,keepdim=True) # B x N x K x 1
+        # local_dpt_tangent2 = (local_pt_difference * tangent2_field[:,:,None,:]).sum(-1,keepdim=True) # B x N x K x 1
+        # local_dpt_tangent = torch.cat((local_dpt_tangent1,local_dpt_tangent2),dim=-1) # B x N x K x 2
+        # # local_dpt_tangent_length2 = local_dpt_tangent.norm(dim=-1,keepdim=True)
+
+        # # # quadratic normalization of the tangent plane
+        # # local_dpt_tangent = local_dpt_tangent/(local_dpt_tangent_length2+1e-8)*torch.exp(-local_dpt_tangent_length2**2)
+
+
+        # local_dnormals_tangent1 = (local_normals_difference * tangent1_field[:,:,None,:]).sum(-1,keepdim=True)
+        # local_dnormals_tangent2 = (local_normals_difference * tangent2_field[:,:,None,:]).sum(-1,keepdim=True)
+        # local_dnormals_tangent = torch.cat((local_dnormals_tangent1,local_dnormals_tangent2),dim=-1) # B x N x K x 2
+
+        # # # quadratic normalization of the tangent plane
+        # # local_dnormals_tangent = local_dnormals_tangent/(local_dpt_tangent_length2+1e-8)*torch.exp(-local_dpt_tangent_length2)
+        
+
+        # # ----------------- weingarten map ---------------------
+
+        # # estimate the weingarten map by solving a least squares problem: W = Dn^T Dp (Dp^T Dp)^-1
+        # XXT = torch.matmul(local_dpt_tangent.transpose(-1,-2),local_dpt_tangent)
+        # YXT = torch.matmul(local_dnormals_tangent.transpose(-1,-2),local_dpt_tangent)
+        # XYT = torch.matmul(local_dpt_tangent.transpose(-1,-2),local_dnormals_tangent)
+        # # Weingarten_fields_0 = torch.matmul(YXT,torch.inverse(XXT+1e-8*torch.eye(2).type_as(XXT))) ## the unsymetric version
+
+        # gaussian_curvature_pcl = torch.det((YXT+XYT))/(torch.det(XXT)+1e-8)/4
+        # # gaussian_curvature_pcl = torch.det((YXT+XYT).matmul(torch.inverse(XXT+1e-8*torch.eye(2).type_as(XXT))))/4
+        # # gaussian_curvature_pcl = torch.det((YXT+XYT).matmul(torch.inverse(XXT+1e-8*torch.eye(2).type_as(XXT))))/4
+        # # gaussian_curvature_pcl = torch.det(YXT.matmul(torch.inverse(XXT+1e-8*torch.eye(2).type_as(XXT))))/4
+            
+        # return gaussian_curvature_pcl
+
+
+    def differentiable_euler_number(self, frames_field: torch.Tensor=None, local_W: int=64, n_temp: int=2000, return_area = False,retrun_gaussian_curvature = False):
+        
+        # weingarten_fields = self.weingarten_fields(frames_field)
+        # gaussian_curvature_pcl = weingarten_fields.det()
+        area = self.local_voronoi_area(frames_field, local_W, n_temp)
+
+        # euler_number = (gaussian_curvature_pcl.view(-1)*area.view(-1)).sum()/np.pi/2
+        # print(euler_number)
         gaussian_curvature_pcl = self.gaussian_curvature(frames_field)
-        euler_number = (gaussian_curvature_pcl.view(-1)*voronoi_area_list.view(-1)).sum()/2/np.pi
+        euler_number = (gaussian_curvature_pcl.view(-1)*area.view(-1)).sum()/np.pi/2
 
-        return euler_number
+        return_ele = (euler_number,)
+        if return_area:
+            return_ele += (area,)
+        if retrun_gaussian_curvature:
+            return_ele += (gaussian_curvature_pcl,)
+
+        return return_ele
     
 
 

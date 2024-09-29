@@ -162,7 +162,6 @@ class Differentiable_Voxelizer(nn.Module):
         return_type: the type of the return
         """
 
-
         # random sampling in bounding box
         resolution = self.bbox_density
         bbox = mesh_src.get_bounding_boxes()[0]
@@ -233,6 +232,5 @@ def normalize_mesh(mesh, rescalar=1.1):
     size = (bbox[:, :, 1] - bbox[:, :, 0]) 
     scale = 2.0 / (torch.max(size)*rescalar+1e-8)
 
-    mesh = mesh.update_padded((mesh.verts_padded()-center)*scale+center)
+    mesh = mesh.update_padded((mesh.verts_padded()-center)*scale)
     return mesh
-
