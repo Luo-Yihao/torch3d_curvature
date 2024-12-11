@@ -1,10 +1,13 @@
 import torch
 import torch.nn as nn
-import pytorch3d 
+
 from pytorch3d.ops import knn_points,knn_gather
 from torch_scatter import scatter
 
 import numpy as np
+
+from einops import repeat, rearrange
+
 
 
 def disambiguate(normals, pointscloud, K = 15):
@@ -29,8 +32,10 @@ def disambiguate(normals, pointscloud, K = 15):
 
         renew_normals = current_normals * direction_consistency
 
-        for j in range(renew_index.shape[1]):
-            normals_field[:,(renew_index[:,j,:]).view(-1),:] = renew_normals[:,j,:,:]
+        for i in range(renew_index.shape[0]):
+            for j in range(renew_index.shape[1]):
+                normals_field[i,(renew_index[i,j,:]).view(-1),:] = renew_normals[i,j,:,:]
+            
             
         finished_set = finished_set.union(current_set)
 
@@ -76,7 +81,7 @@ class Differentiable_Global_Geometry_PointCloud(nn.Module):
         frames_field = torch.linalg.eigh(covs_field).eigenvectors.transpose(-1,-2) # B x N x 3 x 3
 
         # disambiguate the normals
-        frames_field[:,:,0,:] = disambiguate(frames_field[:,:,0,:], pointscloud, K = 5)
+        frames_field[:,:,0,:] = disambiguate(frames_field[:,:,0,:], pointscloud, K = self.k)
 
         frames_field[:,:,1,:] = frames_field[:,:,1,:]*frames_field.det().unsqueeze(-1)
 
@@ -133,38 +138,20 @@ class Differentiable_Global_Geometry_PointCloud(nn.Module):
 
         local_knn_coord_tangent = (local_dpt_tangent - local_knn_bbox_tangent[...,0:1].transpose(-1,-2))/local_knn_bbox_tangent_length.max(-2,keepdim=True).values.repeat(1,1,1,2)*2-1 # B x N x K x 2
 
-        try:
-            local_closest_idx = knn_points(points_meshgrid.repeat(N,1,1), local_knn_coord_tangent.view(-1,k,2),K=1).idx
+        
+        local_closest_idx = knn_points(points_meshgrid.repeat(N*B,1,1), local_knn_coord_tangent.view(-1,k,2),K=1).idx # (B*N) x K x 1
 
-            local_center_voronoi = torch.where(local_closest_idx == 0)
+        
 
-            local_center_voronoi = scatter(torch.ones_like(local_center_voronoi[0]), 
-                                            local_center_voronoi[0],
-                                            dim_size=N)
-        except:  # memory saving strategy for large point clouds
-            local_center_voronoi = torch.zeros(B, N, 1).to(device)
-            n_temp = n_temp # split the point cloud into smaller chunks
-            for n in range(N//n_temp+1):
+        local_center_voronoi = torch.where(local_closest_idx == 0) 
 
-                local_knn_coord_tangent_temp = local_knn_coord_tangent[:, n*n_temp:(n+1)*n_temp].view(-1,k,2)
+        local_center_voronoi = scatter(torch.ones_like(local_center_voronoi[0]), 
+                                        local_center_voronoi[0],
+                                        dim_size=N*B)
+        
+        local_center_voronoi = repeat(local_center_voronoi, '(b n) -> b n 1', b=B, n=N) # B x N
 
-                local_closest_idx = knn_points(points_meshgrid.repeat(local_knn_coord_tangent_temp.shape[0],1,1), local_knn_coord_tangent_temp,K=1).idx
-
-                local_center_voronoi_temp = torch.where(local_closest_idx == 0)
-
-                local_center_voronoi_temp = scatter(torch.ones_like(local_center_voronoi_temp[0]), 
-                                                local_center_voronoi_temp[0],
-                                                dim_size=local_knn_coord_tangent_temp.shape[0])
-
-
-                local_center_voronoi[:, n*n_temp:(n+1)*n_temp] = local_center_voronoi_temp.view(B, -1, 1)
-                
-
-
-
-        voronoi_area_list = local_center_voronoi.view(local_knn_bbox_tangent_length[:,:,0:1,0].shape)
-
-        voronoi_area_list = voronoi_area_list*(local_knn_bbox_tangent_length.max(-2).values**2)/(local_W-1)**2
+        voronoi_area_list = local_center_voronoi*(local_knn_bbox_tangent_length.max(-2).values**2)/(local_W-1)**2
 
 
         return voronoi_area_list
@@ -277,71 +264,26 @@ class Differentiable_Global_Geometry_PointCloud(nn.Module):
 
         return gaussian_curvature_pcl
 
-        
-
-        # # ----------------- tangent plane projection ---------------
-
-        # local_pt_difference = knn_info.knn - self.pointscloud[:,:,None,:] # B x N x K x 3
-
-        # normals_field  = frames_field[:,:,0,:] # B x N x  3
-        # tangent1_field = frames_field[:,:,1,:] # B x N x  3
-        # tangent2_field = frames_field[:,:,2,:]  # B x N x  3
     
 
-        # # project the difference onto the tangent plane, getting the differential of the gaussian map
-
-        # # local normals difference
-        # local_normals_difference = knn_gather(normals_field,knn_info.idx) - normals_field.unsqueeze(-2) # B x N x K x 3
-
-        # # project the difference onto the tangent plane, getting the differential of the gaussian map
-        # local_dpt_tangent1 = (local_pt_difference * tangent1_field[:,:,None,:]).sum(-1,keepdim=True) # B x N x K x 1
-        # local_dpt_tangent2 = (local_pt_difference * tangent2_field[:,:,None,:]).sum(-1,keepdim=True) # B x N x K x 1
-        # local_dpt_tangent = torch.cat((local_dpt_tangent1,local_dpt_tangent2),dim=-1) # B x N x K x 2
-        # # local_dpt_tangent_length2 = local_dpt_tangent.norm(dim=-1,keepdim=True)
-
-        # # # quadratic normalization of the tangent plane
-        # # local_dpt_tangent = local_dpt_tangent/(local_dpt_tangent_length2+1e-8)*torch.exp(-local_dpt_tangent_length2**2)
-
-
-        # local_dnormals_tangent1 = (local_normals_difference * tangent1_field[:,:,None,:]).sum(-1,keepdim=True)
-        # local_dnormals_tangent2 = (local_normals_difference * tangent2_field[:,:,None,:]).sum(-1,keepdim=True)
-        # local_dnormals_tangent = torch.cat((local_dnormals_tangent1,local_dnormals_tangent2),dim=-1) # B x N x K x 2
-
-        # # # quadratic normalization of the tangent plane
-        # # local_dnormals_tangent = local_dnormals_tangent/(local_dpt_tangent_length2+1e-8)*torch.exp(-local_dpt_tangent_length2)
+    def differentiable_euler_number(self, frames_field: torch.Tensor=None, local_W: int=64, n_temp: int=2000, return_area = False,return_gaussian_curvature = False, if_strict: bool=False):
         
-
-        # # ----------------- weingarten map ---------------------
-
-        # # estimate the weingarten map by solving a least squares problem: W = Dn^T Dp (Dp^T Dp)^-1
-        # XXT = torch.matmul(local_dpt_tangent.transpose(-1,-2),local_dpt_tangent)
-        # YXT = torch.matmul(local_dnormals_tangent.transpose(-1,-2),local_dpt_tangent)
-        # XYT = torch.matmul(local_dpt_tangent.transpose(-1,-2),local_dnormals_tangent)
-        # # Weingarten_fields_0 = torch.matmul(YXT,torch.inverse(XXT+1e-8*torch.eye(2).type_as(XXT))) ## the unsymetric version
-
-        # gaussian_curvature_pcl = torch.det((YXT+XYT))/(torch.det(XXT)+1e-8)/4
-        # # gaussian_curvature_pcl = torch.det((YXT+XYT).matmul(torch.inverse(XXT+1e-8*torch.eye(2).type_as(XXT))))/4
-        # # gaussian_curvature_pcl = torch.det((YXT+XYT).matmul(torch.inverse(XXT+1e-8*torch.eye(2).type_as(XXT))))/4
-        # # gaussian_curvature_pcl = torch.det(YXT.matmul(torch.inverse(XXT+1e-8*torch.eye(2).type_as(XXT))))/4
-            
-        # return gaussian_curvature_pcl
-
-
-    def differentiable_euler_number(self, frames_field: torch.Tensor=None, local_W: int=64, n_temp: int=2000, return_area = False,retrun_gaussian_curvature = False):
         
+        B, N = self.pointscloud.shape[:2]
         # weingarten_fields = self.weingarten_fields(frames_field)
         # gaussian_curvature_pcl = weingarten_fields.det()
-        area = self.local_voronoi_area(frames_field, local_W, n_temp)
+        area = self.local_voronoi_area(frames_field, local_W, n_temp) # B x N x 1
+
 
         # euler_number = (gaussian_curvature_pcl.view(-1)*area.view(-1)).sum()/np.pi/2
         # print(euler_number)
-        gaussian_curvature_pcl = self.gaussian_curvature(frames_field)
-        euler_number = (gaussian_curvature_pcl.view(-1)*area.view(-1)).sum()/np.pi/2
+        gaussian_curvature_pcl = self.gaussian_curvature(frames_field, if_strict=if_strict)
+        euler_number = (gaussian_curvature_pcl.view(B,-1)*area.view(B,-1)).sum(-1)/np.pi/2
 
         return_ele = (euler_number,)
         if return_area:
             return_ele += (area,)
-        if retrun_gaussian_curvature:
+        if return_gaussian_curvature:
             return_ele += (gaussian_curvature_pcl,)
 
         return return_ele
