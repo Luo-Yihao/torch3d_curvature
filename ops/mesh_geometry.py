@@ -51,7 +51,7 @@ def vert_feature_packed_padded(Surfaces: Meshes, feature):
     Compute the feature of each vertices in a mesh
     Args:
         Surfaces: Meshes object
-        feature: Tensor of shape (V, d) where V is the number of vertices and d is the feature dimension
+        feature: Tensor of shape (V, d) or (V,) where V is the number of vertices and d is the feature dimension
     Returns:
         vert_feature: Tensor of shape (N,1) where N is the number of vertices
         the feature of a vertices is defined as the sum of the feature of the triangles that contains this vertices divided by the dual area of this vertices
@@ -64,13 +64,12 @@ def vert_feature_packed_padded(Surfaces: Meshes, feature):
 
 def face_feature_packed_padded(Surfaces: Meshes, feature):
     """
-    Compute the feature of each faces in a mesh
+    From the packed face feature to the padded face feature
     Args:
         Surfaces: Meshes object
-        feature: Tensor of shape (F, d) where F is the number of faces and d is the feature dimension
+        feature: Tensor of shape (F, d) or (F,) where F is the number of faces and d is the feature dimension
     Returns:
-        face_feature: Tensor of shape (N,1) where N is the number of vertices
-        the feature of a vertices is defined as the sum of the feature of the faces that contains this vertices divided by the dual area of this vertices
+        face_feature: B x F x d
     """
 
     face_first_idx = Surfaces.mesh_to_faces_packed_first_idx()
@@ -259,7 +258,7 @@ def dual_interpolation_from_verts_to_faces_packed(mesh: Meshes, features_verts: 
     D = features_verts.shape[1]
     if isinstance(mesh, Meshes):
         faces = mesh.faces_packed()
-        V = faces.shape[0]
+        V = mesh.verts_packed().shape[0]
         F = mesh.faces_packed().shape[0]
     elif isinstance(mesh, trimesh.Trimesh):
         faces = torch.tensor(mesh.faces, dtype=torch.long)
@@ -391,9 +390,9 @@ def get_gaussian_curvature_faces_packed(meshes: Meshes, return_density=False)->t
     normal_area = SolidAngle()(trg_mesh_face_normal)
 
     if return_density:
-        return normal_area
+        return normal_area.view(-1,1)
     else:
-        return normal_area/(face_area+1e-10)
+        return (normal_area/(face_area+1e-10)).view(-1,1)
     
 
     
@@ -432,6 +431,117 @@ def get_mean_curvature_vertices_packed(mesh: Meshes):
     L_sum = torch.sparse.sum(L, dim=1).to_dense().view(-1, 1)
     mean_curvature_vector = (L.mm(verts_packed) - L_sum * verts_packed) * 0.5 * inv_areas*3
     mean_curvature = -(mean_curvature_vector*meshes.verts_normals_packed()).sum(dim=-1)
-    return mean_curvature
+    return mean_curvature.view(-1,1)
+
+
+def get_mean_curvature_faces_packed(meshes):
+    """
+    Compute the mean curvature of the mesh faces.
+    """
+    mean_curvature = get_mean_curvature_vertices_packed(meshes).view(-1, 1)
+    mean_curvature_faces = dual_interpolation_from_verts_to_faces_packed(meshes, mean_curvature).squeeze(-1)
+
+    return mean_curvature_faces
+
+
+def get_total_curvature_vertices_packed(meshes):
+    """
+    Compute the total curvature of the mesh vertices.
+    """
+    gaussian_curvature = get_gaussian_curvature_vertices_from_face_packed(meshes).view(-1, 1)
+    mean_curvature = get_mean_curvature_vertices_packed(meshes).view(-1, 1)
+    total_curvature = 4*mean_curvature**2 - gaussian_curvature*2
+
+    total_curvature = total_curvature.view(-1, 1)
+    total_curvature = torch.clamp(total_curvature, min=0)
+
+    return total_curvature/2
+
+def get_total_curvature_faces_packed(meshes):
+    """
+    Compute the total curvature of the mesh faces.
+    """
+    gaussian_curvature = get_gaussian_curvature_faces_packed(meshes, return_density=False).view(-1, 1)
+    mean_curvature = get_mean_curvature_faces_packed(meshes).view(-1, 1)
+    total_curvature_faces = 4*mean_curvature**2 - gaussian_curvature*2
+    total_curvature_faces = torch.clamp(total_curvature_faces, min=0)
+    return total_curvature_faces/2
+
 
 ### ------------------------------------------------------------------------------
+
+def sample_points_from_meshes_by_curvature(mesh: Meshes, num_samples: int, return_normals=False, mode="gaussian", tanh_f=1, area_weight=0.1):
+    """
+    Sample points on the mesh surface based on the curvature of the faces.
+    The probability of sampling a face is proportional to its curvature.
+    """
+    B = mesh.verts_padded().shape[0]
+    area = mesh.faces_areas_packed().view(-1, 1)
+
+    if mode == "gaussian":
+        face_curvature = get_gaussian_curvature_faces_packed(mesh, return_density=False).view(-1, 1)
+    elif mode == "mean":
+        face_curvature = get_mean_curvature_faces_packed(mesh).view(-1, 1)
+    elif mode == "total":
+        face_curvature = get_total_curvature_faces_packed(mesh).view(-1, 1)
+    
+    if tanh_f > 0:
+        face_curvature = torch.tanh(tanh_f * face_curvature)
+    elif tanh_f < 0:
+        assert 1 == 0, "tanh_f must be non-negative"
+        
+
+    face_curvature = face_curvature * area
+    probs = face_feature_packed_padded(mesh, face_curvature).view(B, -1)
+    probs = probs.abs()
+    probs = probs / probs.sum(dim=-1, keepdim=True)
+
+    area_padded = face_feature_packed_padded(mesh, area).view(B, -1)
+    area_probs = area_padded / area_padded.sum(dim=-1, keepdim=True)
+    probs = (1.-area_weight) * probs + area_weight * area_probs
+
+    
+
+    # Sample faces based on area
+    face_indices = torch.multinomial(probs, num_samples, replacement=True)
+
+    # Sample barycentric coordinates
+    
+    verts_dual_weight = get_dual_area_weights_packed(mesh)
+    verts_dual_weight = verts_dual_weight / verts_dual_weight.sum(dim=-1, keepdim=True)
+    verts_dual_weight = face_feature_packed_padded(mesh, verts_dual_weight)
+
+
+    # Gather the corresponding vertices of the sampled faces
+    triangle_coords = get_faces_coordinates_padded(mesh)
+
+    B_idx = torch.tensor(range(B), device=mesh.device).repeat_interleave(num_samples)
+    B_idx = B_idx.view(B,num_samples)
+    triangle_coords = triangle_coords[B_idx, face_indices] # (B, num_samples, 3, 3)
+
+
+    
+    r1 = torch.rand(B, num_samples).to(mesh.device) # (B, num_samples)
+    r2 = torch.rand(B, num_samples).to(mesh.device) # (B, num_samples)
+    u = 1 - r1
+    v = r1 * (1 - r2)
+    w = r1 * r2
+
+
+    # Interpolate points using barycentric coordinates
+    sampled_points = u[:,:,None] * triangle_coords[:, :, 0] + \
+                     v[:,:,None] * triangle_coords[:, :, 1] + \
+                     w[:,:,None] * triangle_coords[:, :, 2]
+    if return_normals:
+        triangle_normals = mesh.verts_normals_packed()[mesh.faces_packed()] # (F, 3, 3)
+        triangle_normals = face_feature_packed_padded(mesh, triangle_normals) # (B, F, 3, 3)    
+        triangle_normals = triangle_normals[B_idx, face_indices] # (B, num_samples, 3, 3)
+
+        sampled_normals = u[:,:,None] * triangle_normals[:, :, 0] + \
+                        v[:,:,None] * triangle_normals[:, :, 1] + \
+                        w[:,:,None] * triangle_normals[:, :, 2]
+        
+        sampled_normals = F.normalize(sampled_normals, p=2, dim=-1)
+        return sampled_points, sampled_normals
+    
+    return sampled_points

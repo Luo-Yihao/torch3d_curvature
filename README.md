@@ -14,6 +14,7 @@
 - [x] **Support for Multiple Representations**: Supports meshes, point clouds (oriented or non-oriented), voxels, implicit functions, and Gaussian splatting.
 - [x] **Batch Processing**: Process multiple meshes in parallel for curvature and topological estimation.
 - [ ] Explore a zero-shot deep learning model for curvature and topological characteristic estimation.
+- [x] **Curvature-guided Mesh Sampling**: Sample points from meshes based on curvature for point cloud extraction with importance sampling.
 
 **Note**: This project corrects several conceptual issues found in `PyTorch3D`. For instance, `pytorch3d.ops.estimate_pointcloud_local_coord_frames` incorrectly derives frames using the covariance matrix of each point in a point cloud. Find the corrected version in `ops.mesh_geometry.Differentiable_Global_Geometry_PointCloud`.
 
@@ -48,7 +49,19 @@ By default, the multi-channel images will be saved in the results folder. The ou
 ![Gaussian Curvatures of the Mesh of Kar](figures/rendering.png "Gaussian Curvatures of the mesh of Kar by DiffCurvature")
 The curvature map's color scheme can be easily customized in the `render.py` file.
 
-Then run the `TUTORIAL.ipynb` notebook for a detailed guide on how to use the core functionalities of the project.
+Sample points from the mesh based on curvature:
+```Python
+from pytorch3d.structures import Meshes
+from ops.mesh_geometry import sample_points_from_meshes_by_curvature
+# Load the mesh
+mesh = Meshes(verts=[verts], faces=[faces_idx])
+# Sample points from the mesh based on curvature
+points, normals = sample_points_from_meshes_by_curvature(mesh, num_samples=10000, return_normals=True)
+```
+The probability of sampling points is proportional to the curvature value, where three modes of sampling are available: `gaussian`, `mean`, and `total` curvature. The visualization of the sampled points is shown as follows:
+![Sampled Points from the Mesh of Kar](figures/curvature_sampling_example.png "Sampled Points from the mesh of Kar by DiffCurvature")
+
+Run the `TUTORIAL.ipynb` notebook for a detailed guide on how to use the core functionalities of the project.
 
 
 ### Usage Example 
